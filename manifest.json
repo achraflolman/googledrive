@@ -1,0 +1,21 @@
+{
+  "name": "Schoolmaps Pro",
+  "short_name": "Schoolmaps",
+  "description": "An all-in-one student dashboard to organize files, manage your calendar, create flashcards, track study time, and stay on top of your schoolwork.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#10b981",
+  "icons": [
+    {
+      "src": "https://i.imgur.com/G5g2wnP.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "https://i.imgur.com/G5g2wnP.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
