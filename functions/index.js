@@ -1,206 +1,165 @@
-const functions = require("firebase-functions");
-const admin = require("firebase-admin");
-const { google } = require("googleapis");
-const cors = require("cors")({ origin: true });
+// functions/index.js
+
+const functions = require('firebase-functions');
+const admin = require('firebase-admin');
+const { google } = require('googleapis');
+const cors = require('cors')({ origin: true }); // NIEUW: Importeer en initialiseer CORS
 
 admin.initializeApp();
 const db = admin.firestore();
 
-// These need to be set in your Firebase environment
-// firebase functions:config:set google.client_id="YOUR_CLIENT_ID"
-// firebase functions:config:set google.client_secret="YOUR_CLIENT_SECRET"
-const CLIENT_ID = functions.config().google.client_id;
-const CLIENT_SECRET = functions.config().google.client_secret;
+// --- Configuratie voor Google OAuth (opgehaald uit Firebase Functions Environment Variables) ---
+const CLIENT_ID = functions.config().googleapi.client_id;
+const CLIENT_SECRET = functions.config().googleapi.client_secret;
+const REDIRECT_URI = functions.config().googleapi.redirect_uri;
 
-// This must be one of the "Authorized redirect URIs" in your Google Cloud Console
-const REDIRECT_URI = "https://schoolmaps-6a5f3.firebaseapp.com/redirect.html";
+const oauth2Client = new google.auth.OAuth2(
+  CLIENT_ID,
+  CLIENT_SECRET,
+  REDIRECT_URI
+);
 
-const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
-
-const SCOPES = [
-    "https://www.googleapis.com/auth/drive.file",
-    "https://www.googleapis.com/auth/userinfo.profile",
-];
-
-const SCHOOLMAPS_FOLDER_NAME = "Schoolmaps Files";
-
-// Helper function to get an authenticated drive client
-async function getDriveClient(uid) {
-    const userPrivateDoc = await db.collection(`artifacts/${admin.app().options.appId}/users/${uid}/private/google`).doc("tokens").get();
-    if (!userPrivateDoc.exists) {
-        throw new functions.https.HttpsError("unauthenticated", "User has not connected their Google Drive account.");
-    }
-    const tokens = userPrivateDoc.data();
-    oauth2Client.setCredentials(tokens);
-    return google.drive({ version: "v3", auth: oauth2Client });
-}
-
-
+// --- Cloud Function 1: getGoogleAuthUrl ---
 exports.getGoogleAuthUrl = functions.https.onCall((data, context) => {
-    if (!context.auth) {
-        throw new functions.https.HttpsError("unauthenticated", "The function must be called while authenticated.");
-    }
+  // CORS handler toevoegen
+  return new Promise((resolve, reject) => {
+    cors(context.req, context.res, async () => { // context.req en context.res zijn beschikbaar in onCall
+      if (!context.auth) {
+        return reject(new functions.https.HttpsError('unauthenticated', 'Authenticatie vereist om Google Drive te koppelen.'));
+      }
 
-    const authUrl = oauth2Client.generateAuthUrl({
-        access_type: "offline",
-        prompt: "consent",
-        scope: SCOPES,
+      const scopes = [
+        'https://www.googleapis.com/auth/drive.file',
+        'https://www.googleapis.com/auth/userinfo.email',
+      ];
+
+      const authUrl = oauth2Client.generateAuthUrl({
+        access_type: 'offline',
+        prompt: 'consent',
+        scope: scopes,
+        state: context.auth.uid,
+      });
+
+      resolve({ authUrl: authUrl });
     });
-
-    return { url: authUrl };
+  });
 });
 
-exports.storeGoogleTokens = functions.https.onCall(async (data, context) => {
-    if (!context.auth) {
-        throw new functions.https.HttpsError("unauthenticated", "The function must be called while authenticated.");
-    }
+// --- Cloud Function 2: saveGoogleDriveTokens ---
+exports.saveGoogleDriveTokens = functions.https.onCall(async (data, context) => {
+  // CORS handler toevoegen
+  return new Promise((resolve, reject) => {
+    cors(context.req, context.res, async () => {
+      if (!context.auth) {
+        return reject(new functions.https.HttpsError('unauthenticated', 'Authenticatie vereist.'));
+      }
+      const userId = context.auth.uid;
+      const code = data.code;
 
-    const { code } = data;
-    if (!code) {
-        throw new functions.https.HttpsError("invalid-argument", "The function must be called with an authorization code.");
-    }
-
-    try {
+      try {
         const { tokens } = await oauth2Client.getToken(code);
-        const { refresh_token } = tokens;
 
-        if (!refresh_token) {
-            throw new functions.https.HttpsError("failed-precondition", "A refresh token was not provided by Google. Please re-authenticate and grant offline access.");
-        }
-        
-        const uid = context.auth.uid;
-        const privateDataRef = db.collection(`artifacts/${admin.app().options.appId}/users/${uid}/private/google`).doc("tokens");
-        await privateDataRef.set({ refresh_token: refresh_token });
+        await db.collection('users').doc(userId).set({
+          googleDriveRefreshToken: tokens.refresh_token,
+          googleDriveLinked: true,
+          googleDriveLastLinked: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
 
-        const publicUserRef = db.collection(`artifacts/${admin.app().options.appId}/public/data/users`).doc(uid);
-        await publicUserRef.update({ isDriveConnected: true });
-
-        return { success: true, message: "Google Drive connected successfully." };
-    } catch (error) {
-        console.error("Error getting tokens:", error.message);
-        throw new functions.https.HttpsError("internal", "Failed to retrieve Google tokens.", error.message);
-    }
+        resolve({ success: true });
+      } catch (error) {
+        console.error("Fout bij opslaan Google Drive tokens:", error);
+        // Controleer of de fout een HttpsError is, anders maak er een
+        const httpsError = error instanceof functions.https.HttpsError ? error : new functions.https.HttpsError('internal', 'Fout bij koppelen Google Drive.', error.message);
+        reject(httpsError);
+      }
+    });
+  });
 });
 
+// --- Cloud Function 3: uploadFileToGoogleDrive ---
+exports.uploadFileToGoogleDrive = functions.https.onCall(async (data, context) => {
+  // CORS handler toevoegen
+  return new Promise((resolve, reject) => {
+    cors(context.req, context.res, async () => {
+      if (!context.auth) {
+        return reject(new functions.https.HttpsError('unauthenticated', 'Authenticatie vereist om bestanden te uploaden.'));
+      }
+      const userId = context.auth.uid;
+      const { fileName, fileContentBase64, mimeType, folderName = 'Schoolmaps Uploads' } = data;
 
-exports.disconnectGoogleDrive = functions.https.onCall(async (data, context) => {
-    if (!context.auth) {
-        throw new functions.https.HttpsError("unauthenticated", "The function must be called while authenticated.");
-    }
-    const uid = context.auth.uid;
-    const privateDataRef = db.collection(`artifacts/${admin.app().options.appId}/users/${uid}/private/google`).doc("tokens");
-    const publicUserRef = db.collection(`artifacts/${admin.app().options.appId}/public/data/users`).doc(uid);
+      const userDoc = await db.collection('users').doc(userId).get();
+      const refreshToken = userDoc.data()?.googleDriveRefreshToken;
 
-    await privateDataRef.delete();
-    await publicUserRef.update({ isDriveConnected: false });
+      if (!refreshToken) {
+        return reject(new functions.https.HttpsError('failed-precondition', 'Google Drive is niet gekoppeld voor deze gebruiker. Koppel je account opnieuw.'));
+      }
 
-    return { success: true, message: "Google Drive disconnected." };
-});
+      oauth2Client.setCredentials({ refresh_token: refreshToken });
 
-async function findOrCreateFolder(drive) {
-    let folderId = null;
-    const query = `mimeType='application/vnd.google-apps.folder' and name='${SCHOOLMAPS_FOLDER_NAME}' and trashed=false`;
-    const res = await drive.files.list({ q: query, fields: 'files(id, name)' });
+      try {
+        const drive = google.drive({ version: 'v3', auth: oauth2Client });
 
-    if (res.data.files.length > 0) {
-        folderId = res.data.files[0].id;
-    } else {
-        const fileMetadata = {
-            name: SCHOOLMAPS_FOLDER_NAME,
-            mimeType: 'application/vnd.google-apps.folder',
-        };
-        const folder = await drive.files.create({
-            resource: fileMetadata,
-            fields: 'id',
-        });
-        folderId = folder.data.id;
-    }
-    return folderId;
-}
-
-
-exports.uploadFileToDrive = functions.runWith({ timeoutSeconds: 300, memory: '1GB' }).https.onCall(async (data, context) => {
-    if (!context.auth) {
-        throw new functions.https.HttpsError("unauthenticated", "The function must be called while authenticated.");
-    }
-
-    const { fileContent, fileName, fileType, title, description, subject } = data;
-    const uid = context.auth.uid;
-
-    try {
-        const drive = await getDriveClient(uid);
-        const folderId = await findOrCreateFolder(drive);
-
-        const fileMetadata = {
-            name: fileName,
-            parents: [folderId],
-        };
-
-        const media = {
-            mimeType: fileType,
-            body: Buffer.from(fileContent, 'base64'),
-        };
-
-        const file = await drive.files.create({
-            resource: fileMetadata,
-            media: media,
-            fields: 'id, name, webContentLink',
+        let folderId = null;
+        const searchFolderRes = await drive.files.list({
+          q: `'root' in parents and mimeType='application/vnd.google-apps.folder' and name='${folderName}' and trashed=false`,
+          fields: 'files(id)',
         });
 
-        // Make the file publicly accessible
-        await drive.permissions.create({
-            fileId: file.data.id,
-            resource: {
-                role: 'reader',
-                type: 'anyone',
+        if (searchFolderRes.data.files.length > 0) {
+          folderId = searchFolderRes.data.files[0].id;
+        } else {
+          const createFolderRes = await drive.files.create({
+            requestBody: {
+              name: folderName,
+              mimeType: 'application/vnd.google-apps.folder',
             },
-        });
-        
-        // Save metadata to Firestore
-        await db.collection(`artifacts/${admin.app().options.appId}/public/data/files`).add({
-            title: title,
-            description: description,
-            subject: subject,
-            ownerId: uid,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            fileUrl: file.data.webContentLink,
-            storagePath: `googledrive/${file.data.id}`, // Custom path format
-            driveFileId: file.data.id
-        });
-
-        return { success: true, fileId: file.data.id };
-
-    } catch (error) {
-        console.error('File upload error:', error);
-        throw new functions.https.HttpsError('internal', 'Unable to upload file.', error.message);
-    }
-});
-
-
-exports.deleteFileFromDrive = functions.https.onCall(async (data, context) => {
-    if (!context.auth) {
-        throw new functions.https.HttpsError("unauthenticated", "The function must be called while authenticated.");
-    }
-    const { fileId, driveFileId } = data;
-    const uid = context.auth.uid;
-
-    try {
-        const drive = await getDriveClient(uid);
-        if (driveFileId) {
-            await drive.files.delete({ fileId: driveFileId });
+            fields: 'id',
+          });
+          folderId = createFolderRes.data.id;
         }
-        
-        // Delete Firestore document
-        await db.collection(`artifacts/${admin.app().options.appId}/public/data/files`).doc(fileId).delete();
 
-        return { success: true };
-    } catch(error) {
-        console.error('File deletion error:', error);
-        // If file not found on Drive, still allow deletion from Firestore
-        if (error.code === 404) {
-             await db.collection(`artifacts/${admin.app().options.appId}/public/data/files`).doc(fileId).delete();
-             return { success: true, message: "File not found on Drive, but removed from app." };
+        const uploadResponse = await drive.files.create({
+          requestBody: {
+            name: fileName,
+            mimeType: mimeType,
+            parents: [folderId],
+          },
+          media: {
+            mimeType: mimeType,
+            body: Buffer.from(fileContentBase64, 'base64'),
+          },
+          fields: 'id,webViewLink,webContentLink',
+        });
+
+        await drive.permissions.create({
+          fileId: uploadResponse.data.id,
+          requestBody: {
+            role: 'reader',
+            type: 'anyone',
+          },
+          fields: 'id',
+        });
+
+        const directDownloadLink = `https://drive.google.com/uc?export=download&id=${uploadResponse.data.id}`;
+
+        resolve({
+          fileId: uploadResponse.data.id,
+          webViewLink: uploadResponse.data.webViewLink,
+          directDownloadLink: directDownloadLink,
+        });
+
+      } catch (error) {
+        console.error("Fout bij uploaden naar Google Drive:", error);
+        if (error.code === 401 || (error.message && error.message.includes('invalid_grant'))) {
+          await db.collection('users').doc(userId).update({
+            googleDriveRefreshToken: admin.firestore.FieldValue.delete(),
+            googleDriveLinked: false,
+          });
+          return reject(new functions.https.HttpsError('unauthenticated', 'Google Drive-verbinding verlopen. Koppel je account opnieuw.'));
         }
-        throw new functions.https.HttpsError('internal', 'Unable to delete file.', error.message);
-    }
+        const httpsError = error instanceof functions.https.HttpsError ? error : new functions.https.HttpsError('internal', 'Fout bij uploaden naar Google Drive.', error.message);
+        reject(httpsError);
+      }
+    });
+  });
 });
