@@ -43,18 +43,36 @@
   </div>
   <script>
     document.addEventListener('DOMContentLoaded', () => {
+      // These are the domains where your app can be hosted.
+      // IMPORTANT: For production, you MUST replace these with your actual domains.
+      const allowedOrigins = [
+        'http://localhost:8080', // TODO: Update with your local dev port if different
+        'https://schoolmaps-6a5f3.web.app',
+        'https://schoolmaps-6a5f3.firebaseapp.com',
+        // TODO: ADD YOUR VERCEL URL HERE, e.g., 'https://your-app-name.vercel.app'
+      ];
+
       const urlParams = new URLSearchParams(window.location.search);
       const code = urlParams.get('code');
+      
       if (window.opener && code) {
         const payload = {
           type: 'google-oauth-code',
           code: code
         };
-        // Use a specific target origin for security in production
-        window.opener.postMessage(payload, window.location.origin);
+
+        // Try to post to the opener only if its origin is in the allowed list.
+        // This is a security measure to prevent sending the code to malicious sites.
+        if (allowedOrigins.includes(window.opener.origin)) {
+          window.opener.postMessage(payload, window.opener.origin);
+        } else {
+          console.warn(`Opener origin (${window.opener.origin}) not in allowed list. The OAuth code will not be sent.`);
+        }
       }
-      // Close the window automatically
-      window.close();
+      
+      // Close the window automatically after a short delay
+      // to ensure the message has time to be sent.
+      setTimeout(() => window.close(), 500);
     });
   </script>
 </body>
